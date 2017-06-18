@@ -1,2 +1,3 @@
 # logstash-input-uptrends
-Example input plugin. This should help bootstrap your effort to write your own input plugin!
+This plugin retrieves monitoring information from uptrends and passes the data in the logstash pipeline.
+This plugin is currently under construction.
