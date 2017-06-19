@@ -3,9 +3,9 @@ require 'date'
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "logstash/plugin_mixins/http_client"
-require "stud/interval"
 require "socket" # for Socket.gethostname
 require "manticore"
+require "rufus/scheduler"
 
 # Generate a repeating message.
 #
@@ -15,6 +15,8 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   include LogStash::PluginMixins::HttpClient
 
   config_name "uptrends"
+
+  SCHEDULE_TYPES = %w(cron every at in)
 
   DATE_PARAMS = [
       :today,
@@ -56,66 +58,159 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   # If undefined, Logstash will complain, even if codec is unused.
   default :codec, "json"
 
-  # The message string to use in the event.
-  config :message, :validate => :string, :default => "Hello world!"
-
-  # Set how frequently messages should be sent.
-  #
-  # The default, `1`, means send a message every second.
-  config :interval, :validate => :number, :default => 3
+  config :url_template, :validate => :string, :default => "/probes"
 
   config :parameters, :validate => :hash, :default => {}
 
-  config :url_template, :validate => :string, :default => "/probes"
+  # Schedule of when to periodically poll from the urls
+  # Format: A hash with
+  #   + key: "cron" | "every" | "in" | "at"
+  #   + value: string
+  # Examples:
+  #   a) { "every" => "1h" }
+  #   b) { "cron" => "* * * * * UTC" }
+  # See: rufus/scheduler for details about different schedule options and value string format
+  config :schedule, :validate => :hash
 
-  # config :time_range, :validate => time_ranges.map{ |range| range.to_s }, :default => :current_month
+  # Define the target field for placing the received data. If this setting is omitted, the data will be stored at the root (top level) of the event.
+  config :target, :validate => :string
+
+  # If you'd like to work with the request/response metadata.
+  # Set this value to the name of the field you'd like to store a nested
+  # hash of metadata.
+  config :metadata_target, :validate => :string, :default => '@metadata'
 
   public
   def register
     @host = Socket.gethostname
+    @logger.info("Registering uptrends Input", :type => @type,
+                 :url_template => @url_template, :parameters => @parameters, :schedule => @schedule)
   end
 
-  # def register
-
   def run(queue)
-    # we can abort the loop if stop? becomes true
-    while !stop?
-      # id = rand(100)
-      # url = "https://jsonplaceholder.typicode.com/posts/" + id.to_s
-      # response_body = client.get(url).body
-      #event = LogStash::Event.new("message" => "Resonse: " + response_body.to_s, "host" => @host)
-
-      url = populate_url_template
-      event = LogStash::Event.new("message" => url, "host" => @host)
-
-      decorate(event)
-      queue << event
-      # because the sleep interval can be big, when shutdown happens
-      # we want to be able to abort the sleep
-      # Stud.stoppable_sleep will frequently evaluate the given block
-      # and abort the sleep(@interval) if the return value is true
-      Stud.stoppable_sleep(@interval) {stop?}
-    end # loop
+    raise LogStash::ConfigurationError, "Invalid config. No schedule was specified." unless @schedule
+    raise LogStash::ConfigurationError, "Invalid config. URL template seems to be incorrect." unless validate_url
+    setup_schedule(queue)
   end
 
   # def run
 
+  def setup_schedule(queue)
+    #schedule hash must contain exactly one of the allowed keys
+    msg_invalid_schedule = "Invalid config. schedule hash must contain " +
+        "exactly one of the following keys - cron, at, every or in"
+    raise Logstash::ConfigurationError, msg_invalid_schedule if @schedule.keys.length !=1
+    schedule_type = @schedule.keys.first
+    schedule_value = @schedule[schedule_type]
+    raise LogStash::ConfigurationError, msg_invalid_schedule unless SCHEDULE_TYPES.include?(schedule_type)
+
+    @scheduler = Rufus::Scheduler.new(:max_work_threads => 1)
+    #as of v3.0.9, :first_in => :now doesn't work. Use the following workaround instead
+    opts = schedule_type == "every" ? {:first_in => 0.01} : {}
+    @scheduler.send(schedule_type, schedule_value, opts) {run_once(queue)}
+    @scheduler.join
+  end
+
+  def run_once(queue)
+    started = Time.now
+
+    url = "https://api.uptrends.com/v3/" + populate_url_template
+    url = url + (url =~ /.*\?.*/ ? "?" : "&") + "format=json"
+
+    @logger.debug? && @logger.debug("Fetching URL", :url => url)
+
+    client.parallel.get(url).
+        on_success {|response| handle_success(queue, url, response, Time.now - started)}.
+        on_failure {|exception| handle_failure(queue, url, exception, Time.now - started)
+    }
+
+    client.execute!
+  end
+
   def stop
-    # nothing to do in this case so it is not necessary to define stop
-    # examples of common "stop" tasks:
-    #  * close sockets (unblocking blocking reads/accepts)
-    #  * cleanup temporary files
-    #  * terminate spawned threads
+    @scheduler.stop if @scheduler
   end
 
   private
-  def handle_success(queue, name, request, response, execution_time)
+  def handle_success(queue, url, response, execution_time)
+    @logger.debug? && @logger.debug("Response received", :code => response.code.to_s)
+    body = response.body
+    # If there is a usable response. HEAD requests are `nil` and empty get
+    # responses come up as "" which will cause the codec to not yield anything
+    if body && body.size > 0
+      @codec.decode(body) do |decoded|
+        event = @target ? LogStash::Event.new(@target => decoded.to_hash) : LogStash::Event.new("message" => decoded)
+        handle_decoded_event(queue, url, response, event, execution_time)
+      end
+    else
+      event = ::LogStash::Event.new
+      handle_decoded_event(queue, url, response, event, execution_time)
+    end
   end
 
   private
   # Beware, on old versions of manticore some uncommon failures are not handled
-  def handle_failure(queue, name, request, exception, execution_time)
+  def handle_failure(queue, url, exception, execution_time)
+    @logger.debug? && @logger.debug("Request failed", :exception => exception.to_s)
+    event = LogStash::Event.new
+    apply_metadata(event, url)
 
+    # This is also in the metadata, but we send it anyone because we want this
+    # persisted by default, whereas metadata isn't. People don't like mysterious errors
+    event.set("http_request_failure", {
+        "url" => url,
+        "error" => exception.to_s,
+        "backtrace" => exception.backtrace,
+        "runtime_seconds" => execution_time
+    })
+
+    event.tag("_http_request_failure")
+    queue << event
+  rescue StandardError, java.lang.Exception => e
+    @logger.error? && @logger.error("Cannot read URL or send the error as an event!",
+                                    :exception => e,
+                                    :exception_message => e.message,
+                                    :exception_backtrace => e.backtrace,
+                                    :url => url
+    )
+  end
+
+  private
+  def handle_decoded_event(queue, url, response, event, execution_time)
+    apply_metadata(event, url, response, execution_time)
+    decorate(event)
+    queue << event
+  rescue StandardError, java.lang.Exception => e
+    @logger.error? && @logger.error("Error eventifying response!",
+                                    :exception => e,
+                                    :exception_message => e.message,
+                                    :response => response
+    )
+  end
+
+  private
+  def apply_metadata(event, url, response=nil, execution_time=nil)
+    return unless @metadata_target
+    event.set(@metadata_target, event_metadata(url, response, execution_time))
+  end
+
+  private
+  def event_metadata(url, response=nil, execution_time=nil)
+    m = {
+        "host" => @host,
+        "url" => url
+    }
+
+    m["runtime_seconds"] = execution_time
+
+    if response
+      m["code"] = response.code
+      m["response_headers"] = response.headers
+      m["response_message"] = response.message
+      m["times_retried"] = response.times_retried
+    end
+
+    m
   end
 
   private
@@ -211,7 +306,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
   private
   def symbolized_params(parameters)
-    parameters.inject({}) do |hash,(k,v)|
+    parameters.inject({}) do |hash, (k, v)|
       case v
         when Date
           hash[k.to_sym] = v.strftime('%Y/%m/%d')
@@ -220,6 +315,11 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
       end
       hash
     end
+  end
+
+  private
+  def validate_url
+    !(@url_template !~ /\A\/(probes|probegroups|checkpointservers)(\/([\d\w]{4}-){3}[\d\w]{4}\/.*)?\z/)
   end
 
 end # class LogStash::Inputs::Uptrends
