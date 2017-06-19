@@ -18,43 +18,6 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
   SCHEDULE_TYPES = %w(cron every at in)
 
-  DATE_PARAMS = [
-      :today,
-      :yesterday,
-
-      # MONTH - CURRENT
-      :first_day_of_current_month,
-      :last_day_of_current_month,
-
-      # MONTH - PREVIOUS
-      :first_day_of_previous_month,
-      :last_day_of_previous_month,
-
-      # WEEK - CURRENT
-      :monday_of_current_week,
-      :tuesday_of_current_week,
-      :wednesday_of_current_week,
-      :thursday_of_current_week,
-      :friday_of_current_week,
-      :saturday_of_current_week,
-      :sunday_of_current_week,
-
-      # WEEK - PREVIOUS
-      :monday_of_previous_week,
-      :tuesday_of_previous_week,
-      :wednesday_of_previous_week,
-      :thursday_of_previous_week,
-      :friday_of_previous_week,
-      :saturday_of_previous_week,
-      :sunday_of_previous_week,
-
-      # DATEPARTS
-      :current_day_of_month,
-      :current_month,
-      :current_year,
-      :previous_month
-  ]
-
   # If undefined, Logstash will complain, even if codec is unused.
   default :codec, "json"
 
@@ -114,12 +77,16 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   def run_once(queue)
     started = Time.now
 
-    url = "https://api.uptrends.com/v3/" + populate_url_template
-    url = url + (url =~ /.*\?.*/ ? "?" : "&") + "format=json"
+    url = build_url
 
     @logger.debug? && @logger.debug("Fetching URL", :url => url)
 
-    client.parallel.get(url).
+    req_opts = Hash.new
+
+    # TODO add auth config
+    req_opts[:auth] = {user: "username", password: "password", eager: true}
+
+    client.parallel.get(url, req_opts).
         on_success {|response| handle_success(queue, url, response, Time.now - started)}.
         on_failure {|exception| handle_failure(queue, url, exception, Time.now - started)
     }
@@ -214,11 +181,22 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def populate_url_template
+  def build_url
     today = Date.today
+    url = "https://api.uptrends.com/v3/" << String.new(@url_template)
 
-    param_values = LogStash::Inputs::Uptrends::DATE_PARAMS.each.with_object({}) do |param, param_values|
-      param_values[param] = case param
+    param_values = Hash.new
+
+    @parameters.each_key {|k|
+      k_sym = case k
+                when Symbol
+                  k
+                when String
+                  k.to_sym
+                else
+                  raise LogStash::ConfigurationError, "Invaild parameter '" << k.to_s << "'"
+              end
+      param_values[k_sym] = case @parameters[k].to_sym
                               when :today
                                 today
                               when :yesterday
@@ -268,14 +246,13 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
                               when :previous_month
                                 day_of_different_month(today, -1, 1).strftime('%m')
                               else
-                                # TODO error handling
-                                Date.new(1970, 1, 1)
+                                @parameters[k]
                             end
-    end
+    }
 
-    # param_values.merge!(symbolized_params(@parameters))
+    param_values[:format] = "json"
 
-    @url_template % symbolized_params(param_values.merge(@parameters))
+    url << "?" << URI.encode_www_form(format_params(param_values))
   end
 
   private
@@ -305,7 +282,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def symbolized_params(parameters)
+  def format_params(parameters)
     parameters.inject({}) do |hash, (k, v)|
       case v
         when Date
@@ -319,7 +296,11 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
   private
   def validate_url
-    !(@url_template !~ /\A\/(probes|probegroups|checkpointservers)(\/([\d\w]{4}-){3}[\d\w]{4}\/.*)?\z/)
+    matches_pattern(@url_template, /\A(probes|probegroups|checkpointservers)(\/[\d\w]{32}\/.*)?\z/)
   end
 
+  private
+  def matches_pattern(string, pattern)
+    !(string !~ pattern)
+  end
 end # class LogStash::Inputs::Uptrends
