@@ -20,14 +20,78 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
   BASE_URL = "https://api.uptrends.com/v3/"
 
-  # If undefined, Logstash will complain, even if codec is unused.
   default :codec, "json"
 
+  # Specify, which operations shall be performed on the given Uptrends entities.
+  # This configuration must contain a path key whose value is the URL of the operation.
+  # Supported operations are (see https://api.uptrends.com/v3/metadata):
+  #   * AlertsRequest
+  #   * CheckpointServer
+  #   * Probe
+  #   * ProbeChartStatisticsRequest
+  #   * ProbeGroup
+  #   * ProbeGroupMember
+  #   * ProbeGroupMembers
+  #   * ProbeGroupStatisticsRequest
+  #   * ProbeGroupStatusRequest
+  #   * ProbeStatisticsRequest
+  #   * ProbeStatusRequest
+  # Take a look at the following example. The GUID in the path property is the unique ID of the Uptrends entity.
+  # You can specify operation parameters such as the beginning of a requested time period by adding them to the
+  # configuration.
+  # There are a number of placeholders available which are replaced during runtime:
+  #   * "today"
+  #   * "yesterday"
+  #   * "first_day_of_current_month"
+  #   * "last_day_of_current_month"
+  #   * "first_day_of_previous_month"
+  #   * "last_day_of_previous_month"
+  #   * "monday_of_current_week"
+  #   * "tuesday_of_current_week"
+  #   * "wednesday_of_current_week"
+  #   * "thursday_of_current_week"
+  #   * "friday_of_current_week"
+  #   * "saturday_of_current_week"
+  #   * "sunday_of_current_week"
+  #   * "monday_of_previous_week"
+  #   * "tuesday_of_previous_week"
+  #   * "wednesday_of_previous_week"
+  #   * "thursday_of_previous_week"
+  #   * "friday_of_previous_week"
+  #   * "saturday_of_previous_week"
+  #   * "sunday_of_previous_week"
+  #   * "current_day_of_month"
+  #   * "current_month"
+  #   * "current_year"
+  #   * "previous_month
+  # [source, ruby]
+  # -----------------------------------------------
+  # operations => {
+  #   probegroup_stats => {
+  #     path => "/probegroups/{GUID}/statistics"
+  #     type => "uptrends-statistic"
+  #     parameters => {
+  #       "Start" => "monday_of_previous_week"
+  #       "End" => "sunday_of_previous_week"
+  #       "Dimension" => "Probe"
+  #     }
+  #   }
+  # }
+  # -----------------------------------------------
   config :operations, :validate => :hash, :required => true
 
+  # Specify the credentials of your Uptrends account here.
+  # For example:
+  # [source, ruby]
+  # -----------------------------------------------
+  # auth => {
+  #   userame: "user@domain.com"
+  #   password: "password123"
+  # }
+  # -----------------------------------------------
   config :auth, :validate => :hash, :required => true
 
-  # Schedule of when to periodically poll from the urls
+  # Schedule of when to periodically poll from Uptrends
   # Format: A hash with
   #   + key: "cron" | "every" | "in" | "at"
   #   + value: string
@@ -100,7 +164,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   def trans_validate_url(name, url)
     raise LogStash::ConfigurationError, "No URL provided for operation #{name}" if url.nil? || url.length == 0
 
-    url.gsub!(Regexp.new(BASE_URL), "")
+    url.gsub!(/(http:\/\/)?(www.)?api\.uptrends\.com\/v\d+\//, '')
 
     unless matches_pattern(url, /\A(\/)?(probes|probegroups|checkpointservers)(\/[\d\w]{32}\/.*)?\z/)
       raise LogStash::ConfigurationError, "Invalid URL Invalid URL #{url} for operation #{name}"
