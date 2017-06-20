@@ -99,7 +99,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   #   a) { "every" => "1h" }
   #   b) { "cron" => "* * * * * UTC" }
   # See: rufus/scheduler for details about different schedule options and value string format
-  config :schedule, :validate => :hash
+  config :schedule, :validate => :hash, :required => true
 
   # Define the target field for placing the received data. If this setting is omitted, the data will be stored at the root (top level) of the event.
   config :target, :validate => :string
@@ -119,7 +119,6 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   def run(queue)
-    raise LogStash::ConfigurationError, "Invalid config. No schedule was specified." unless @schedule
     setup_schedule(queue)
   end
 
@@ -220,7 +219,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
     request = build_request(operation[:path], operation[:parameters])
 
-    log_request(request)
+    log_request(name, request)
 
     url = request.delete(:url)
 
@@ -258,8 +257,6 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
     event = LogStash::Event.new
     apply_metadata(event, name, operation)
 
-    # This is also in the metadata, but we send it anyone because we want this
-    # persisted by default, whereas metadata isn't. People don't like mysterious errors
     event.set("http_request_failure", {
         "url" => operation[:path],
         "error" => exception.to_s,
@@ -403,7 +400,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
     request_params[:format] = "json"
 
-    request[:url] = BASE_URL << String.new(operation_path)
+    request[:url] = BASE_URL + String.new(operation_path)
     request[:query] = format_params(request_params)
     request[:auth] = {
         user: @auth[:user],
@@ -459,7 +456,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def log_request(request)
+  def log_request(name, request)
     if @logger.debug?
       masked_request = Hash.new
 
@@ -473,7 +470,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
         masked_request[key] = v
       }
 
-      @logger.debug("Sending request", :request => masked_request)
+      @logger.debug("Sending request", :name => name, :request => masked_request)
     end
   end
 end # class LogStash::Inputs::Uptrends
