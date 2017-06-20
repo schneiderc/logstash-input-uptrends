@@ -21,9 +21,15 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   # If undefined, Logstash will complain, even if codec is unused.
   default :codec, "json"
 
-  config :url_template, :validate => :string, :default => "/probes"
+  # TODO LÖSCHEN
+  config :url_template, :validate => :string, :default => "/probes", :deprecated => true
 
-  config :parameters, :validate => :hash, :default => {}
+  #TODO LÖSCHEN
+  config :parameters, :validate => :hash, :default => {}, :deprecated => true
+
+  config :operations, :validate => :hash, :required => true
+
+  config :auth, :validate => :hash, :required => true
 
   # Schedule of when to periodically poll from the urls
   # Format: A hash with
@@ -75,27 +81,30 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   def run_once(queue)
-    started = Time.now
-
-    url = build_url
-
-    @logger.debug? && @logger.debug("Fetching URL", :url => url)
-
-    req_opts = Hash.new
-
-    # TODO add auth config
-    req_opts[:auth] = {user: "username", password: "password", eager: true}
-
-    client.parallel.get(url, req_opts).
-        on_success {|response| handle_success(queue, url, response, Time.now - started)}.
-        on_failure {|exception| handle_failure(queue, url, exception, Time.now - started)
-    }
+    @operations.each do |name, operation|
+      request_asynch(queue, name, operation)
+    end
 
     client.execute!
   end
 
   def stop
     @scheduler.stop if @scheduler
+  end
+
+  private
+  def request_asynch(queue, name, operation)
+    started = Time.now
+
+    request = build_request(operation[:path], operation[:parameters])
+    url = request.delete(:url)
+
+    @logger.debug? && @logger.debug("Fetching URL", :url => url)
+
+    client.parallel.get(url, request).
+        on_success {|response| handle_success(queue, url, response, Time.now - started)}.
+        on_failure {|exception| handle_failure(queue, url, exception, Time.now - started)
+    }
   end
 
   private
@@ -181,13 +190,13 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def build_url
+  def build_request(operation_path, parameters = {})
     today = Date.today
-    url = "https://api.uptrends.com/v3/" << String.new(@url_template)
 
-    param_values = Hash.new
+    request = Hash.new
+    request_params = Hash.new
 
-    @parameters.each_key {|k|
+    parameters.each_key {|k|
       k_sym = case k
                 when Symbol
                   k
@@ -196,7 +205,7 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
                 else
                   raise LogStash::ConfigurationError, "Invaild parameter '" << k.to_s << "'"
               end
-      param_values[k_sym] = case @parameters[k].to_sym
+      request_params[k_sym] = case parameters[k].to_sym
                               when :today
                                 today
                               when :yesterday
@@ -250,9 +259,17 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
                             end
     }
 
-    param_values[:format] = "json"
+    request_params[:format] = "json"
 
-    url << "?" << URI.encode_www_form(format_params(param_values))
+    request[:url] = "https://api.uptrends.com/v3/" << String.new(operation_path)
+    request[:query] = request_params
+    request[:auth] = {
+        user:     @auth[:user],
+        password: @auth[:password],
+        eager:    true
+    }
+
+    request
   end
 
   private
