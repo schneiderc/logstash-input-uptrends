@@ -18,14 +18,10 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
 
   SCHEDULE_TYPES = %w(cron every at in)
 
+  BASE_URL = "https://api.uptrends.com/v3/"
+
   # If undefined, Logstash will complain, even if codec is unused.
   default :codec, "json"
-
-  # TODO LÖSCHEN
-  config :url_template, :validate => :string, :default => "/probes", :deprecated => true
-
-  #TODO LÖSCHEN
-  config :parameters, :validate => :hash, :default => {}, :deprecated => true
 
   config :operations, :validate => :hash, :required => true
 
@@ -53,17 +49,79 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   def register
     @host = Socket.gethostname
     @logger.info("Registering uptrends Input", :type => @type,
-                 :url_template => @url_template, :parameters => @parameters, :schedule => @schedule)
+                 :operations => @operations, :schedule => @schedule)
+
+    normalize_operations!
   end
 
   def run(queue)
     raise LogStash::ConfigurationError, "Invalid config. No schedule was specified." unless @schedule
-    raise LogStash::ConfigurationError, "Invalid config. URL template seems to be incorrect." unless validate_url
     setup_schedule(queue)
   end
 
   # def run
 
+  private
+  def normalize_operations!
+    normalize_auth!
+    @normed_operations = Hash[@operations.map {|name, operation| [name.to_sym, normalize_operation(name, operation)]}]
+  end
+
+  private
+  def normalize_auth!
+    @auth = Hash[@auth.map {|k, v| [k.to_sym, v]}] # symbolize key
+
+    if @auth[:user].nil? || @auth[:password].nil?
+      raise LogStash::ConfigurationError, "'user' and 'password' must both be specified within auth!"
+    end
+  end
+
+  private
+  def normalize_operation(name, operation)
+    nop = Hash.new
+
+    if operation.is_a?(String)
+      url = operation
+    elsif operation.is_a?(Hash)
+      nop = Hash[operation.map {|k, v| [k.to_sym, v]}] # symbolize key
+      url = nop.delete(:path)
+    else
+      raise LogStash::ConfigurationError, "Invalid operations specification: '#{operation}', expected a String or Hash!"
+    end
+
+    nop[:path] = trans_validate_url(name, url)
+
+    validate_operation(name, nop)
+    nop
+  end
+
+  private
+  # Transforms and validates the url
+  def trans_validate_url(name, url)
+    raise LogStash::ConfigurationError, "No URL provided for operation #{name}" if url.nil? || url.length == 0
+
+    url.gsub!(Regexp.new(BASE_URL), "")
+
+    unless matches_pattern(url, /\A(\/)?(probes|probegroups|checkpointservers)(\/[\d\w]{32}\/.*)?\z/)
+      raise LogStash::ConfigurationError, "Invalid URL Invalid URL #{url} for operation #{name}"
+    end
+
+    url.gsub!(/\A\//, '')
+    url
+  end
+
+  private
+  def validate_operation(name, nop)
+    nop.each_key {|key|
+      unless [:path, :parameters, :type].include?(key)
+        raise LogStash::ConfigurationError, "Unknown key #{key} for operation #{name}"
+      end
+    }
+
+    raise LogStash::ConfigurationError, "Parameters for operation #{name} is not a Hash!" unless nop[:parameters].is_a?(Hash)
+  end
+
+  private
   def setup_schedule(queue)
     #schedule hash must contain exactly one of the allowed keys
     msg_invalid_schedule = "Invalid config. schedule hash must contain " +
@@ -81,8 +139,8 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   def run_once(queue)
-    @operations.each do |name, operation|
-      request_asynch(queue, name, operation)
+    @normed_operations.each do |name, operation|
+      request_async(queue, name, operation)
     end
 
     client.execute!
@@ -93,48 +151,53 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def request_asynch(queue, name, operation)
+  def request_async(queue, name, operation)
     started = Time.now
 
     request = build_request(operation[:path], operation[:parameters])
+
+    log_request(request)
+
     url = request.delete(:url)
 
-    @logger.debug? && @logger.debug("Fetching URL", :url => url)
+    #replace placeholder-parameters with runtime data
+    operation[:query] = request[:query]
 
     client.parallel.get(url, request).
-        on_success {|response| handle_success(queue, url, response, Time.now - started)}.
-        on_failure {|exception| handle_failure(queue, url, exception, Time.now - started)
+        on_success {|response| handle_success(queue, name, operation, response, Time.now - started)}.
+        on_failure {|exception| handle_failure(queue, name, operation, exception, Time.now - started)
     }
   end
 
   private
-  def handle_success(queue, url, response, execution_time)
+  def handle_success(queue, name, operation, response, execution_time)
     @logger.debug? && @logger.debug("Response received", :code => response.code.to_s)
     body = response.body
+
     # If there is a usable response. HEAD requests are `nil` and empty get
     # responses come up as "" which will cause the codec to not yield anything
     if body && body.size > 0
       @codec.decode(body) do |decoded|
-        event = @target ? LogStash::Event.new(@target => decoded.to_hash) : LogStash::Event.new("message" => decoded)
-        handle_decoded_event(queue, url, response, event, execution_time)
+        event = @target ? LogStash::Event.new(@target => decoded.to_hash) : decoded
+        handle_decoded_event(queue, name, operation, response, event, execution_time)
       end
     else
       event = ::LogStash::Event.new
-      handle_decoded_event(queue, url, response, event, execution_time)
+      handle_decoded_event(queue, name, operation, response, event, execution_time)
     end
   end
 
   private
   # Beware, on old versions of manticore some uncommon failures are not handled
-  def handle_failure(queue, url, exception, execution_time)
+  def handle_failure(queue, name, operation, exception, execution_time)
     @logger.debug? && @logger.debug("Request failed", :exception => exception.to_s)
     event = LogStash::Event.new
-    apply_metadata(event, url)
+    apply_metadata(event, name, operation)
 
     # This is also in the metadata, but we send it anyone because we want this
     # persisted by default, whereas metadata isn't. People don't like mysterious errors
     event.set("http_request_failure", {
-        "url" => url,
+        "url" => operation[:path],
         "error" => exception.to_s,
         "backtrace" => exception.backtrace,
         "runtime_seconds" => execution_time
@@ -152,8 +215,12 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def handle_decoded_event(queue, url, response, event, execution_time)
-    apply_metadata(event, url, response, execution_time)
+  def handle_decoded_event(queue, name, operation, response, event, execution_time)
+    # set event type
+    type = operation[:type].to_s
+    event.set("type", type) unless type.nil? || type.length == 0
+
+    apply_metadata(event, name, operation, response, execution_time)
     decorate(event)
     queue << event
   rescue StandardError, java.lang.Exception => e
@@ -165,17 +232,26 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def apply_metadata(event, url, response=nil, execution_time=nil)
+  def apply_metadata(event, name, operation, response=nil, execution_time=nil)
     return unless @metadata_target
-    event.set(@metadata_target, event_metadata(url, response, execution_time))
+    event.set(@metadata_target, event_metadata(name, operation, response, execution_time))
   end
 
   private
-  def event_metadata(url, response=nil, execution_time=nil)
+  def event_metadata(name, operation, response=nil, execution_time=nil)
+
     m = {
         "host" => @host,
-        "url" => url
+        "url" => operation[:path],
+        "name" => name
     }
+
+    operation_params = operation[:query]
+
+    unless operation_params.nil?
+      operation_params.map {|k, v| [k.to_s, v]}
+      m["parameters"] = operation_params
+    end
 
     m["runtime_seconds"] = execution_time
 
@@ -196,77 +272,79 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
     request = Hash.new
     request_params = Hash.new
 
-    parameters.each_key {|k|
-      k_sym = case k
-                when Symbol
-                  k
-                when String
-                  k.to_sym
-                else
-                  raise LogStash::ConfigurationError, "Invaild parameter '" << k.to_s << "'"
-              end
-      request_params[k_sym] = case parameters[k].to_sym
-                              when :today
-                                today
-                              when :yesterday
-                                today - 1
-                              when :first_day_of_current_month
-                                Date.new(today.year, today.month, 1)
-                              when :last_day_of_current_month
-                                day_of_different_month(today, 1, 1) - 1
-                              when :first_day_of_previous_month
-                                day_of_different_month(today, -1, 1)
-                              when :last_day_of_previous_month
-                                Date.new(today.year, today.month, 1) - 1
-                              when :monday_of_current_week
-                                day_of_week(today, 1)
-                              when :tuesday_of_current_week
-                                day_of_week(today, 2)
-                              when :wednesday_of_current_week
-                                day_of_week(today, 3)
-                              when :thursday_of_current_week
-                                day_of_week(today, 4)
-                              when :friday_of_current_week
-                                day_of_week(today, 5)
-                              when :saturday_of_current_week
-                                day_of_week(today, 6)
-                              when :sunday_of_current_week
-                                day_of_week(today, 7)
-                              when :monday_of_previous_week
-                                day_of_previous_week(today, 1)
-                              when :tuesday_of_previous_week
-                                day_of_previous_week(today, 2)
-                              when :wednesday_of_previous_week
-                                day_of_previous_week(today, 3)
-                              when :thursday_of_previous_week
-                                day_of_previous_week(today, 4)
-                              when :friday_of_previous_week
-                                day_of_previous_week(today, 5)
-                              when :saturday_of_previous_week
-                                day_of_previous_week(today, 6)
-                              when :sunday_of_previous_week
-                                day_of_previous_week(today, 7)
-                              when :current_day_of_month
-                                today.strftime('%d')
-                              when :current_month
-                                today.strftime('%m')
-                              when :current_year
-                                today.strftime('%Y')
-                              when :previous_month
-                                day_of_different_month(today, -1, 1).strftime('%m')
-                              else
-                                @parameters[k]
-                            end
-    }
+    unless parameters.nil?
+      parameters.each_key {|k|
+        k_sym = case k
+                  when Symbol
+                    k
+                  when String
+                    k.to_sym
+                  else
+                    raise LogStash::ConfigurationError, "Invaild parameter '" << k.to_s << "'"
+                end
+        request_params[k_sym] = case parameters[k].to_sym
+                                  when :today
+                                    today
+                                  when :yesterday
+                                    today - 1
+                                  when :first_day_of_current_month
+                                    Date.new(today.year, today.month, 1)
+                                  when :last_day_of_current_month
+                                    day_of_different_month(today, 1, 1) - 1
+                                  when :first_day_of_previous_month
+                                    day_of_different_month(today, -1, 1)
+                                  when :last_day_of_previous_month
+                                    Date.new(today.year, today.month, 1) - 1
+                                  when :monday_of_current_week
+                                    day_of_week(today, 1)
+                                  when :tuesday_of_current_week
+                                    day_of_week(today, 2)
+                                  when :wednesday_of_current_week
+                                    day_of_week(today, 3)
+                                  when :thursday_of_current_week
+                                    day_of_week(today, 4)
+                                  when :friday_of_current_week
+                                    day_of_week(today, 5)
+                                  when :saturday_of_current_week
+                                    day_of_week(today, 6)
+                                  when :sunday_of_current_week
+                                    day_of_week(today, 7)
+                                  when :monday_of_previous_week
+                                    day_of_previous_week(today, 1)
+                                  when :tuesday_of_previous_week
+                                    day_of_previous_week(today, 2)
+                                  when :wednesday_of_previous_week
+                                    day_of_previous_week(today, 3)
+                                  when :thursday_of_previous_week
+                                    day_of_previous_week(today, 4)
+                                  when :friday_of_previous_week
+                                    day_of_previous_week(today, 5)
+                                  when :saturday_of_previous_week
+                                    day_of_previous_week(today, 6)
+                                  when :sunday_of_previous_week
+                                    day_of_previous_week(today, 7)
+                                  when :current_day_of_month
+                                    today.strftime('%d')
+                                  when :current_month
+                                    today.strftime('%m')
+                                  when :current_year
+                                    today.strftime('%Y')
+                                  when :previous_month
+                                    day_of_different_month(today, -1, 1).strftime('%m')
+                                  else
+                                    parameters[k]
+                                end
+      }
+    end
 
     request_params[:format] = "json"
 
-    request[:url] = "https://api.uptrends.com/v3/" << String.new(operation_path)
-    request[:query] = request_params
+    request[:url] = BASE_URL << String.new(operation_path)
+    request[:query] = format_params(request_params)
     request[:auth] = {
-        user:     @auth[:user],
+        user: @auth[:user],
         password: @auth[:password],
-        eager:    true
+        eager: true
     }
 
     request
@@ -312,12 +390,26 @@ class LogStash::Inputs::Uptrends < LogStash::Inputs::Base
   end
 
   private
-  def validate_url
-    matches_pattern(@url_template, /\A(probes|probegroups|checkpointservers)(\/[\d\w]{32}\/.*)?\z/)
+  def matches_pattern(string, pattern)
+    !(string !~ pattern)
   end
 
   private
-  def matches_pattern(string, pattern)
-    !(string !~ pattern)
+  def log_request(request)
+    if @logger.debug?
+      masked_request = Hash.new
+
+      request.each_key{|key|
+        if key == :auth
+          auth = request[key]
+          v = { user: auth[:user], password: auth[:password].gsub(/./, "*")}
+        else
+          v = request[key]
+        end
+        masked_request[key] = v
+      }
+
+      @logger.debug("Sending request", :request => masked_request)
+    end
   end
 end # class LogStash::Inputs::Uptrends
