@@ -1,6 +1,6 @@
 Gem::Specification.new do |s|
   s.name          = 'logstash-input-uptrends'
-  s.version       = '0.1.0'
+  s.version       = '0.1.1'
   s.licenses      = ['Apache License (2.0)']
   s.summary       = 'Acceppt events from Uptrends'
   s.description   = 'This gem is a Logstash plugin required to be installed on top of the Logstash core pipeline using $LS_HOME/bin/logstash-plugin install gemname. This gem is not a stand-alone program'
@@ -20,7 +20,7 @@ Gem::Specification.new do |s|
   # Gem dependencies
   s.add_runtime_dependency "logstash-core-plugin-api", ">= 1.60", "<= 2.99"
   s.add_runtime_dependency 'logstash-codec-plain'
-  s.add_runtime_dependency 'logstash-mixin-http_client', ">= 2.2.4", "< 5.0.0"
+  s.add_runtime_dependency 'logstash-mixin-http_client', ">= 5.0.0", "< 6.0.0"
   s.add_runtime_dependency 'rufus-scheduler', "~>3.0.9"
 
   s.add_development_dependency 'logstash-codec-json'
